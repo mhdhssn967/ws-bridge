@@ -1,0 +1,16 @@
+{
+  "name": "unity-websocket-bridge",
+  "version": "1.0.0",
+  "description": "Bridges Unity's native WebSockets to a Socket.IO server.",
+  "main": "ws-bridge.js",
+  "type": "module",
+  "scripts": {
+    "start": "node ws-bridge.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "ws": "^8.16.0",
+    "socket.io-client": "^4.7.4"
+  }
+}
