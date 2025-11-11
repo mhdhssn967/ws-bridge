@@ -1,52 +1,62 @@
-// bridge-server.js (Render-friendly version)
-import WebSocket, { WebSocketServer } from "ws";
 import net from "net";
+import WebSocket from "ws";
 
-const PORT = process.env.PORT || 8080;
+const TCP_PORT = 10000; // Unity connects here
+const WS_URL = "wss://ws-bridge.onrender.com"; // your Render signaling bridge
 
-// Create one TCP server for Unity
-const tcpServer = net.createServer();
-tcpServer.listen(PORT, () => {
-  console.log(`🎮 TCP (Unity) and WS Bridge running on port ${PORT}`);
-});
+// === TCP SERVER (for Unity) ===
+const tcpServer = net.createServer((unitySocket) => {
+  console.log("🟢 Unity connected via TCP");
 
-let unitySocket = null;
+  // Connect to WebSocket bridge
+  const ws = new WebSocket(WS_URL);
 
-// Create WebSocket server sharing the same port
-const wss = new WebSocketServer({ noServer: true });
-
-// When Render’s HTTP upgrade request happens, attach WS
-tcpServer.on("connection", (socket) => {
-  // Detect if this is a WebSocket upgrade or a Unity TCP connection
-  socket.once("data", (buffer) => {
-    const str = buffer.toString();
-    if (str.startsWith("GET")) {
-      // WebSocket handshake
-      socket.unshift(buffer);
-      wss.handleUpgrade(socket, socket.request || {}, Buffer.alloc(0), (ws) => {
-        wss.emit("connection", ws, socket.request);
-      });
-    } else {
-      console.log("🎮 Unity TCP connected");
-      unitySocket = socket;
-    }
+  ws.on("open", () => {
+    console.log("🌐 Connected to WebSocket bridge");
   });
-});
-
-wss.on("connection", (ws) => {
-  console.log("🌐 WebSocket client connected (browser)");
-
-  if (!unitySocket) {
-    ws.send(JSON.stringify({ error: "Unity not connected yet" }));
-    return;
-  }
 
   ws.on("message", (msg) => {
-    unitySocket.write(msg.toString().trim() + "\n");
+    // Forward messages from WS → Unity
+    try {
+      const text = msg.toString().trim();
+      if (text) {
+        unitySocket.write(text + "\n");
+        console.log("➡️ WS → Unity:", text.slice(0, 80));
+      }
+    } catch (err) {
+      console.error("Error forwarding to Unity:", err);
+    }
   });
 
   unitySocket.on("data", (data) => {
-    const messages = data.toString().split("\n").filter((m) => m.trim() !== "");
-    for (const msg of messages) ws.send(msg);
+    // Forward messages from Unity → WS
+    const messages = data.toString().split("\n").filter(Boolean);
+    for (const msg of messages) {
+      try {
+        ws.send(msg);
+        console.log("⬅️ Unity → WS:", msg.slice(0, 80));
+      } catch (err) {
+        console.error("Error forwarding to WS:", err);
+      }
+    }
   });
+
+  unitySocket.on("close", () => {
+    console.log("🔴 Unity TCP disconnected");
+    ws.close();
+  });
+
+  unitySocket.on("error", (err) => {
+    console.error("Unity TCP error:", err);
+    ws.close();
+  });
+
+  ws.on("close", () => {
+    console.log("🔴 WebSocket closed");
+    unitySocket.destroy();
+  });
+});
+
+tcpServer.listen(TCP_PORT, () => {
+  console.log(`🚀 TCP–WS bridge listening on port ${TCP_PORT}`);
 });
