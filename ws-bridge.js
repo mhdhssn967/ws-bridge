@@ -1,102 +1,52 @@
-import express from "express";
-import http from "http";
-// Note: We use the client-side socket.io-client, not the Server class from 'socket.io'
-import ioClient from "socket.io-client"; 
-import { WebSocketServer } from "ws";
-import cors from "cors";
+// bridge-server.js (Render-friendly version)
+import WebSocket, { WebSocketServer } from "ws";
+import net from "net";
 
-// --- Configuration ---
-// IMPORTANT: This URL points to your existing Node.js Socket.IO signaling server
-const SIGNALING_SERVER_URL = "https://signaling-server-happymoves.onrender.com";
-// The port the bridge will listen on for Unity connections
-const PORT = process.env.BRIDGE_PORT || 8090;
+const PORT = process.env.PORT || 8080;
 
-const app = express();
-app.use(cors());
-app.get("/", (req, res) => res.send("✅ WebSocket bridge for Unity is running."));
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-// ---- Handle Unity connections ----
-wss.on("connection", (ws, req) => {
-    console.log("[Bridge] Unity connected");
-    
-    // Create a new Socket.IO client connection for this specific Unity WebSocket connection
-    const socket = ioClient(SIGNALING_SERVER_URL, {
-        transports: ["websocket"],
-        reconnection: true,
-    });
-
-    socket.on("connect", () => {
-        console.log(`[Bridge] ${ws._socket.remoteAddress} connected to Socket.IO signaling server`);
-    });
-
-    socket.on("disconnect", () => {
-        console.log(`[Bridge] ${ws._socket.remoteAddress} disconnected from signaling server`);
-    });
-    
-    // --- Relay Socket.IO messages → Unity (Incoming from other peers/server) ---
-    // Unity client expects: { "type": "event_name", "payload": { ... } }
-    const forwardEvents = ["offer", "answer", "ice-candidate", "peer-joined", "peer-left", "joined"];
-    forwardEvents.forEach(event =>
-        socket.on(event, (data) => {
-            // Only send if the Unity connection is open
-            if (ws.readyState === ws.OPEN) {
-                // Unity uses JObject (Newtonsoft.Json), which expects a clean JSON object payload here
-                const message = JSON.stringify({ type: event, payload: data });
-                ws.send(message);
-                // console.log(`[Bridge] Relayed SIO event '${event}' to Unity: ${message.substring(0, 50)}...`);
-            }
-        })
-    );
-
-    // --- Relay Unity → Socket.IO (Outgoing commands like join, offer, answer) ---
-    // Unity sends: { "type": "join", "roomId": "test" } (flat JObject structure)
-    ws.on("message", (message) => {
-        try {
-            const msg = JSON.parse(message.toString());
-
-            if (!msg.type) {
-                console.error("[Bridge] Invalid message format from Unity (missing type field).");
-                return;
-            }
-            
-            const eventType = msg.type;
-            
-            // Prepare the payload by removing the 'type' field from the original message object
-            // This leaves the rest of the object (like roomId, sdp, candidate) as the payload.
-            const { type, ...payload } = msg;
-
-            // Handle the Unity event name mismatch: Unity sends 'ice', Socket.IO expects 'ice-candidate'
-            const sioEvent = (eventType === 'ice') ? 'ice-candidate' : eventType;
-
-            // Emit the event to the Socket.IO server
-            socket.emit(sioEvent, payload);
-            // console.log(`[Bridge] Emitted SIO event '${sioEvent}' from Unity with payload:`, payload);
-
-        } catch (err) {
-            console.error("[Bridge] Error parsing or forwarding message from Unity:", err.message);
-        }
-    });
-
-    // --- Cleanup ---
-    ws.on("close", () => {
-        console.log("[Bridge] Unity disconnected. Closing SIO connection.");
-        socket.disconnect();
-    });
-    
-    ws.on("error", (err) => {
-        console.error("[Bridge] WebSocket error with Unity client:", err.message);
-        socket.disconnect();
-    });
-    
-    socket.on("error", (err) => {
-        console.error("[Bridge] Socket.IO client error:", err.message);
-    });
+// Create one TCP server for Unity
+const tcpServer = net.createServer();
+tcpServer.listen(PORT, () => {
+  console.log(`🎮 TCP (Unity) and WS Bridge running on port ${PORT}`);
 });
 
-server.listen(PORT, () => {
-    console.log(`🚀 [Bridge] Server listening on port ${PORT}.`);
-    console.log(`Unity should connect to: ws://localhost:${PORT} (or wss://your-domain.com)`);
+let unitySocket = null;
+
+// Create WebSocket server sharing the same port
+const wss = new WebSocketServer({ noServer: true });
+
+// When Render’s HTTP upgrade request happens, attach WS
+tcpServer.on("connection", (socket) => {
+  // Detect if this is a WebSocket upgrade or a Unity TCP connection
+  socket.once("data", (buffer) => {
+    const str = buffer.toString();
+    if (str.startsWith("GET")) {
+      // WebSocket handshake
+      socket.unshift(buffer);
+      wss.handleUpgrade(socket, socket.request || {}, Buffer.alloc(0), (ws) => {
+        wss.emit("connection", ws, socket.request);
+      });
+    } else {
+      console.log("🎮 Unity TCP connected");
+      unitySocket = socket;
+    }
+  });
+});
+
+wss.on("connection", (ws) => {
+  console.log("🌐 WebSocket client connected (browser)");
+
+  if (!unitySocket) {
+    ws.send(JSON.stringify({ error: "Unity not connected yet" }));
+    return;
+  }
+
+  ws.on("message", (msg) => {
+    unitySocket.write(msg.toString().trim() + "\n");
+  });
+
+  unitySocket.on("data", (data) => {
+    const messages = data.toString().split("\n").filter((m) => m.trim() !== "");
+    for (const msg of messages) ws.send(msg);
+  });
 });
